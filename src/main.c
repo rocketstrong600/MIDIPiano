@@ -12,7 +12,6 @@
 typedef struct {
   uint64_t first_s_time;
   uint64_t second_s_time;
-  uint8_t first_pressed;
   uint8_t pressed;
 } KeyState;
 
@@ -36,6 +35,11 @@ typedef union {
 
 
 KeyInfo keys[NUMBER_KEYS];
+
+#define SUSTAIN_PIN 27
+
+uint8_t Sustain_Pressed;
+uint64_t last_sustain_time = 0;
 
 
 void midi_task(void);
@@ -179,7 +183,10 @@ int main(void)
 }
 
 void usb_core_task(void)
-{  
+{
+  gpio_init(SUSTAIN_PIN);
+  gpio_set_dir(SUSTAIN_PIN, GPIO_IN);
+  gpio_pull_up(SUSTAIN_PIN);
   while (1)
   {
     tud_task(); // tinyusb device task
@@ -192,7 +199,7 @@ uint8_t scan_row_col(unsigned int col, unsigned int row) {
     gpio_put(col, 1);
     //sleep_us(5);
     // Wait For Pin to Stabalise Voltage
-    busy_wait_at_least_cycles(100);
+    busy_wait_at_least_cycles(128);
     //Test RowPin
     uint8_t state = gpio_get(row);
     gpio_put(col, 0);
@@ -206,9 +213,8 @@ void scan_matrix(void)
     uint8_t first_state = scan_row_col(key->col_pin_first, key->row_pin_first);
     uint8_t second_state = scan_row_col(key->col_pin_second,key->row_pin_second);
 
-    if (first_state && key->key_state.pressed == 0) {
+    if (first_state && key->key_state.first_s_time == 0) {
       key->key_state.pressed = 1;
-      key->key_state.first_pressed = 1; 
       key->key_state.first_s_time = time_us_64();
 
       MidiNoteMessage note;
@@ -216,23 +222,24 @@ void scan_matrix(void)
       note.data.on = 1;
       note.data.velocity = 127;
       multicore_fifo_push_blocking(note.bits);
-
     }
-    
 
-    if (second_state && key->key_state.pressed == 0) {
+    if (second_state && key->key_state.second_s_time == 0) {
       key->key_state.pressed = 1;
       key->key_state.second_s_time = time_us_64();
+
     }
     
-    if (second_state == 0 && first_state == 0 && key->key_state.first_pressed == 1) {      
+    if (second_state == 0 && first_state == 0 && key->key_state.pressed) {      
       MidiNoteMessage note;
       note.data.note = key->note_number;
       note.data.on = 0;
       note.data.velocity = 0;
       multicore_fifo_push_blocking(note.bits);
-      key->key_state.first_pressed = 0; 
-      key->key_state.pressed = 0; 
+      
+      key->key_state.pressed = 0;
+      key->key_state.first_s_time = 0;
+      key->key_state.second_s_time = 0;
     }
 
   }
@@ -286,20 +293,39 @@ void midi_task(void)
   if (multicore_fifo_rvalid()) {
     MidiNoteMessage note;
     note.bits = multicore_fifo_pop_blocking();
-    uint8_t note_stream[3];
-
-    if (note.data.on) {
-      note_stream[0] = 0x90 | channel;
-      note_stream[1] = note.data.note;
-      note_stream[2] = note.data.velocity;
-      printf("Sending Note On %u Velocity %u\n", note.data.note, note.data.velocity);
-    } else {
-      note_stream[0] = 0x80 | channel;
-      note_stream[1] = note.data.note;
-      note_stream[2] = note.data.velocity;
-      printf("Sending Note Off %u Velocity %u\n", note.data.note, note.data.velocity);
-    }
+    uint8_t note_stream[3] = {
+      (note.data.on ? 0x90 : 0x80) | channel,
+      note.data.note,
+      note.data.velocity
+    };
+    // printf("Sending Note %s %u Velocity %u\n", (note.data.on ? "ON" : "OFF"), note.data.note, note.data.velocity);
     tud_midi_stream_write(cable_num, note_stream, 3);
+  }
+
+  uint64_t current_time = time_us_64();
+
+  if (gpio_get(SUSTAIN_PIN) == 0 && Sustain_Pressed == 0 && current_time - last_sustain_time > 25000) {
+    Sustain_Pressed = 1;
+    last_sustain_time = time_us_64();
+    uint8_t cc_stream[3] = {
+      0xB0 | channel,
+      64,
+      127
+    };
+    // printf("Sending CC 64 ON (Sustain)\n");
+    tud_midi_stream_write(cable_num, cc_stream, 3);
+  }
+
+  if (gpio_get(SUSTAIN_PIN) == 1 && Sustain_Pressed == 1 && current_time - last_sustain_time > 25000) {
+    Sustain_Pressed = 0;
+
+    uint8_t cc_stream[3] = {
+      0xB0 | channel,
+      64,
+      0
+    };
+    // printf("Sending CC 64 OFF (Sustin)\n");
+    tud_midi_stream_write(cable_num, cc_stream, 3);
   }
 
 }
