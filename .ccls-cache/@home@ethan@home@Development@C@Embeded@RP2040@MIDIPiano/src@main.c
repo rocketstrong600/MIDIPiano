@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -8,6 +9,10 @@
 #include "hardware/sync.h"
 
 #define NUMBER_KEYS 88
+
+#define VELOCITY_TD_MAX 25000
+#define VELOCITY_TD_MIN 2000
+#define ALPHA (log(1.0 / 127) / (VELOCITY_TD_MAX - VELOCITY_TD_MIN))
 
 typedef struct {
   uint64_t first_s_time;
@@ -27,8 +32,8 @@ typedef struct {
 typedef union {  
   struct {
     uint8_t note;
-    uint8_t velocity;
     uint8_t on;
+    uint16_t time_diff;
   } data;
   uint32_t bits;
 } MidiNoteMessage; 
@@ -216,25 +221,29 @@ void scan_matrix(void)
     if (first_state && key->key_state.first_s_time == 0) {
       key->key_state.pressed = 1;
       key->key_state.first_s_time = time_us_64();
-
-      MidiNoteMessage note;
-      note.data.note = key->note_number;
-      note.data.on = 1;
-      note.data.velocity = 127;
-      multicore_fifo_push_blocking(note.bits);
     }
 
     if (second_state && key->key_state.second_s_time == 0) {
       key->key_state.pressed = 1;
       key->key_state.second_s_time = time_us_64();
 
+      uint32_t time_diff = key->key_state.second_s_time - key->key_state.first_s_time;
+      time_diff = time_diff > VELOCITY_TD_MAX ? VELOCITY_TD_MAX : time_diff;
+      time_diff = time_diff < VELOCITY_TD_MIN ? VELOCITY_TD_MIN : time_diff;
+      
+      //printf("Note %u, TimeDiff %u\n", key->note_number, time_diff);
+      MidiNoteMessage note;
+      note.data.note = key->note_number;
+      note.data.on = 1;
+      note.data.time_diff = (uint16_t) time_diff;
+      multicore_fifo_push_blocking(note.bits);
     }
     
     if (second_state == 0 && first_state == 0 && key->key_state.pressed) {      
       MidiNoteMessage note;
       note.data.note = key->note_number;
       note.data.on = 0;
-      note.data.velocity = 0;
+      note.data.time_diff = 0;
       multicore_fifo_push_blocking(note.bits);
       
       key->key_state.pressed = 0;
@@ -277,6 +286,26 @@ void tud_resume_cb(void)
 //--------------------------------------------------------------------+
 
 
+uint8_t calculateVelocity(uint32_t timeDiff, uint32_t minTime, uint32_t maxTime) {
+    // Clamp the time difference to ensure it’s within the min and max bounds
+    if (timeDiff < minTime) timeDiff = minTime;
+    if (timeDiff > maxTime) timeDiff = maxTime;
+
+    // Calculate the range
+    uint32_t timeRange = maxTime - minTime;
+    
+    // Calculate the normalized square ratio
+    float ratio = (float)(timeDiff - minTime) / timeRange;
+    float squaredRatio = ratio * ratio;
+
+    // Apply the inverse squared curve for MIDI velocity, scaled to 1 - 127
+    uint8_t velocity = (uint8_t)(127 * (1.0f - squaredRatio));
+
+    // Clamp to the maximum MIDI velocity range
+    if (velocity > 127) velocity = 127;
+    return velocity;
+}
+
 void midi_task(void)
 {
 
@@ -293,12 +322,16 @@ void midi_task(void)
   if (multicore_fifo_rvalid()) {
     MidiNoteMessage note;
     note.bits = multicore_fifo_pop_blocking();
+
+    printf("%u TimeDiff For Note %u\n", note.data.time_diff, note.data.note);
+
+    uint8_t velocity = note.data.on ? calculateVelocity(note.data.time_diff, VELOCITY_TD_MIN, VELOCITY_TD_MAX) : 0;
     uint8_t note_stream[3] = {
       (note.data.on ? 0x90 : 0x80) | channel,
       note.data.note,
-      note.data.velocity
+      velocity
     };
-    // printf("Sending Note %s %u Velocity %u\n", (note.data.on ? "ON" : "OFF"), note.data.note, note.data.velocity);
+    printf("Sending Note %s %u Velocity %u\n", (note.data.on ? "ON" : "OFF"), note.data.note, velocity);
     tud_midi_stream_write(cable_num, note_stream, 3);
   }
 
@@ -312,7 +345,7 @@ void midi_task(void)
       64,
       127
     };
-    // printf("Sending CC 64 ON (Sustain)\n");
+    printf("Sending CC 64 ON (Sustain)\n");
     tud_midi_stream_write(cable_num, cc_stream, 3);
   }
 
@@ -324,7 +357,7 @@ void midi_task(void)
       64,
       0
     };
-    // printf("Sending CC 64 OFF (Sustin)\n");
+    printf("Sending CC 64 OFF (Sustin)\n");
     tud_midi_stream_write(cable_num, cc_stream, 3);
   }
 
