@@ -7,6 +7,10 @@ include(lib/pico-sdk/pico_sdk_init.cmake)
 
 project(MidiPiano C CXX ASM)
 
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "tusb.h"
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -10,23 +11,20 @@
 
 #define NUMBER_KEYS 88
 
-#define VELOCITY_TD_MAX 25000
-#define VELOCITY_TD_MIN 2000
-#define ALPHA (log(1.0 / 127) / (VELOCITY_TD_MAX - VELOCITY_TD_MIN))
+#define VELOCITY_TD_MAX 17000
+#define VELOCITY_TD_MIN 3600
 
-typedef struct {
-  uint64_t first_s_time;
-  uint64_t second_s_time;
-  uint8_t pressed;
-} KeyState;
+//#define VELOCITY_ENABLED
+
 
 typedef struct {
   unsigned int row_pin_first;
   unsigned int col_pin_first;
   unsigned int row_pin_second;
   unsigned int col_pin_second;
-  uint8_t note_number;
-  KeyState key_state;
+  uint8_t note_number;  
+  uint64_t s_event_time;
+  uint8_t pressed;
 } KeyInfo;
 
 typedef union {  
@@ -61,9 +59,11 @@ void init_key(unsigned int key_index, uint8_t note_number, unsigned int r_pin_f,
   
   gpio_init(c_pin_f);
   gpio_set_dir(c_pin_f, GPIO_OUT);
+  gpio_set_drive_strength(c_pin_f, GPIO_DRIVE_STRENGTH_12MA);
 
   gpio_init(c_pin_s);
   gpio_set_dir(c_pin_s, GPIO_OUT);
+  gpio_set_drive_strength(c_pin_s, GPIO_DRIVE_STRENGTH_12MA);
 
   
   gpio_init(r_pin_f);
@@ -204,7 +204,7 @@ uint8_t scan_row_col(unsigned int col, unsigned int row) {
     gpio_put(col, 1);
     //sleep_us(5);
     // Wait For Pin to Stabalise Voltage
-    busy_wait_at_least_cycles(128);
+    busy_wait_at_least_cycles(100);
     //Test RowPin
     uint8_t state = gpio_get(row);
     gpio_put(col, 0);
@@ -218,38 +218,47 @@ void scan_matrix(void)
     uint8_t first_state = scan_row_col(key->col_pin_first, key->row_pin_first);
     uint8_t second_state = scan_row_col(key->col_pin_second,key->row_pin_second);
 
-    if (first_state && key->key_state.first_s_time == 0) {
-      key->key_state.pressed = 1;
-      key->key_state.first_s_time = time_us_64();
+    if ((first_state || second_state) && key->s_event_time == 0) {
+      key->s_event_time = time_us_64();
+    #ifndef VELOCITY_ENABLED
+      key->pressed = 1;
+      MidiNoteMessage note;
+      note.data.note = key->note_number;
+      note.data.on = 1;
+      note.data.time_diff = (uint16_t) VELOCITY_TD_MIN;
+      multicore_fifo_push_blocking(note.bits);
+    #endif
     }
 
-    if (second_state && key->key_state.second_s_time == 0) {
-      key->key_state.pressed = 1;
-      key->key_state.second_s_time = time_us_64();
+    if ((second_state && first_state) && !key->pressed) {
+      key->pressed = 1;
+      uint32_t time_diff = abs(time_us_64() - key->s_event_time);
+      time_diff = time_diff > 65534 ? 65534 : time_diff;
 
-      uint32_t time_diff = key->key_state.second_s_time - key->key_state.first_s_time;
-      time_diff = time_diff > VELOCITY_TD_MAX ? VELOCITY_TD_MAX : time_diff;
-      time_diff = time_diff < VELOCITY_TD_MIN ? VELOCITY_TD_MIN : time_diff;
-      
-      //printf("Note %u, TimeDiff %u\n", key->note_number, time_diff);
+      key->s_event_time = time_us_64();
+
+    #ifdef VELOCITY_ENABLED
       MidiNoteMessage note;
       note.data.note = key->note_number;
       note.data.on = 1;
       note.data.time_diff = (uint16_t) time_diff;
       multicore_fifo_push_blocking(note.bits);
+    #endif
+      
+      //printf("Note %u, TimeDiff %u\n", key->note_number, time_diff);
     }
     
-    if (second_state == 0 && first_state == 0 && key->key_state.pressed) {      
+    if (!second_state && !first_state && key->pressed && abs(key->s_event_time - time_us_64()) >= 5000) {      
       MidiNoteMessage note;
       note.data.note = key->note_number;
       note.data.on = 0;
       note.data.time_diff = 0;
       multicore_fifo_push_blocking(note.bits);
       
-      key->key_state.pressed = 0;
-      key->key_state.first_s_time = 0;
-      key->key_state.second_s_time = 0;
+      key->pressed = 0;
+      key->s_event_time = 0;
     }
+
 
   }
 }
@@ -294,15 +303,9 @@ uint8_t calculateVelocity(uint32_t timeDiff, uint32_t minTime, uint32_t maxTime)
     // Calculate the range
     uint32_t timeRange = maxTime - minTime;
     
-    // Calculate the normalized square ratio
-    float ratio = (float)(timeDiff - minTime) / timeRange;
-    float squaredRatio = ratio * ratio;
-
-    // Apply the inverse squared curve for MIDI velocity, scaled to 1 - 127
-    uint8_t velocity = (uint8_t)(127 * (1.0f - squaredRatio));
-
-    // Clamp to the maximum MIDI velocity range
+    uint8_t velocity = (uint8_t)(127 * (maxTime - timeDiff) / (maxTime - minTime));    // Clamp to the maximum MIDI velocity range
     if (velocity > 127) velocity = 127;
+    if (velocity < 1) velocity = 1;
     return velocity;
 }
 
@@ -323,7 +326,6 @@ void midi_task(void)
     MidiNoteMessage note;
     note.bits = multicore_fifo_pop_blocking();
 
-    printf("%u TimeDiff For Note %u\n", note.data.time_diff, note.data.note);
 
     uint8_t velocity = note.data.on ? calculateVelocity(note.data.time_diff, VELOCITY_TD_MIN, VELOCITY_TD_MAX) : 0;
     uint8_t note_stream[3] = {
@@ -332,6 +334,9 @@ void midi_task(void)
       velocity
     };
     printf("Sending Note %s %u Velocity %u\n", (note.data.on ? "ON" : "OFF"), note.data.note, velocity);
+    if (note.data.on) {
+      printf("%u TimeDiff For Note %u\n", note.data.time_diff, note.data.note);
+    }
     tud_midi_stream_write(cable_num, note_stream, 3);
   }
 
