@@ -1,9 +1,6 @@
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.25)
 
-
-
-set(BOARD pico_sdk)
-include(lib/pico-sdk/pico_sdk_init.cmake)
+include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 
 project(MidiPiano C CXX ASM)
 
@@ -16,6 +13,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 pico_sdk_init()
+
+
+set(FAMILY rp2040)
+set(BOARD pico_sdk)
+
+set(TINYUSB_LWIP_PATH ${PICO_LWIP_PATH})
+# Some examples use this, and we need to set this here due to a bug in the TinyUSB CMake config
+set(TOP ${PICO_TINYUSB_PATH})
 
 set(SRC ${SRC} src/main.c)
 set(SRC ${SRC} src/usb_descriptors.c)

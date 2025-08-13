@@ -204,7 +204,7 @@ uint8_t scan_row_col(unsigned int col, unsigned int row) {
     gpio_put(col, 1);
     //sleep_us(5);
     // Wait For Pin to Stabalise Voltage
-    busy_wait_at_least_cycles(100);
+    busy_wait_at_least_cycles(120);
     //Test RowPin
     uint8_t state = gpio_get(row);
     gpio_put(col, 0);
