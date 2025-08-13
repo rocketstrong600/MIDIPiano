@@ -8,37 +8,50 @@
 #include "pico/multicore.h"
 #include "hardware/gpio.h"
 #include "hardware/sync.h"
-#include "hardware/irq.h"
 
 #define NUMBER_KEYS 88
 
 // --- TUNING PARAMETERS ---
-#define VELOCITY_TD_MIN 3000
-#define VELOCITY_TD_MAX 20000
-#define VELOCITY_CURVE_EXPONENT 1.8f
-#define DEBOUNCE_US 5000
+
+// VELOCITY_TD_MIN: The shortest time difference (in microseconds) for the fastest possible key press.
+// This corresponds to a velocity of 127. You'll need to tune this by testing your fastest key presses.
+#define VELOCITY_TD_MIN 7000
+
+// VELOCITY_TD_MAX: The longest time difference (in microseconds) for the slowest possible key press.
+// This corresponds to a velocity of 1. You'll need to tune this by testing your slowest key presses.
+#define VELOCITY_TD_MAX 55000
+
+// VELOCITY_CURVE_EXPONENT: Adjusts the feel of the velocity.
+// > 1.0: You need to press harder to get loud notes. Good for expressive playing.
+// = 1.0: Linear curve (like your original code).
+// < 1.0: It's easier to play loud notes.
+// A good starting point is 1.5 or 2.0.
+#define VELOCITY_CURVE_EXPONENT 1.6f
+
+// DEBOUNCE_US: Time in microseconds to wait for a key state to be stable before accepting it.
+// This prevents noise from creating false key presses. 5000us (5ms) is a good starting point.
+#define DEBOUNCE_US 1000
+
+// Defines whether to use the velocity sensing logic.
+// For your project, this should be defined.
 #define VELOCITY_ENABLED
 
-// --- NEW DATA STRUCTURES FOR INTERRUPT HANDLING ---
 
-// We need a way to quickly find a key based on its row pin.
-// This struct will hold all keys that share a single row pin.
-typedef struct {
-    unsigned int row_pin;
-    unsigned int key_indices[12]; // Max of 12 columns per row in your design
-    unsigned int num_keys_on_row;
-} RowMapping;
-
-// An array to hold the mappings for each unique row.
-#define NUM_UNIQUE_ROWS 15
-RowMapping row_maps[NUM_UNIQUE_ROWS];
-
-
+// NEW: KeyState enum to create a state machine for each key.
+// This makes debouncing and state tracking much cleaner and more reliable.
 typedef enum {
-    STATE_RELEASED,
-    STATE_PRESSED_FIRST, // We only need two states now, as the interrupt handles the "in-between"
+    STATE_RELEASED,             // Key is up.
+    STATE_DEBOUNCE_PRESS,       // First sensor is triggered, waiting for it to be stable.
+    STATE_PRESSED_FIRST,        // First sensor is confirmed down, waiting for the second.
+    STATE_DEBOUNCE_SECOND,      // Second sensor is triggered, waiting for it to be stable.
+    STATE_PRESSED_FULL,         // Both sensors are confirmed down. Note On has been sent.
+    STATE_DEBOUNCE_RELEASE      // Both sensors are up, waiting for it to be stable.
 } KeyState;
 
+
+// UPDATED: KeyInfo struct now uses the KeyState enum.
+// The old `pressed` and `s_event_time` variables have been replaced
+// by the state machine for clarity and reliability.
 typedef struct {
     unsigned int row_pin_first;
     unsigned int col_pin_first;
@@ -46,8 +59,7 @@ typedef struct {
     unsigned int col_pin_second;
     uint8_t note_number;
     KeyState state;
-    uint64_t first_press_time; // Timestamp for the first sensor press
-    volatile uint64_t last_irq_time; // Timestamp for the last interrupt on this key's row, for debouncing
+    uint64_t event_time; // Generic timestamp used for debouncing and velocity timing.
 } KeyInfo;
 
 typedef union {
@@ -63,36 +75,16 @@ typedef union {
 KeyInfo keys[NUMBER_KEYS];
 
 #define SUSTAIN_PIN 27
+
 uint8_t Sustain_Pressed;
 uint64_t last_sustain_time = 0;
 
 
 void midi_task(void);
 void usb_core_task(void);
-// The main scan_matrix function is now replaced by the interrupt handler
-void gpio_callback(uint gpio, uint32_t events);
+void scan_matrix(void);
 
-
-// --- NEW HELPER FUNCTIONS ---
-
-// Helper to find a row map by its pin number
-RowMapping* find_row_map(uint pin) {
-    for (int i = 0; i < NUM_UNIQUE_ROWS; i++) {
-        if (row_maps[i].row_pin == pin) {
-            return &row_maps[i];
-        }
-    }
-    return NULL;
-}
-
-// Helper to initialize the row mappings
-void init_row_maps() {
-    for (int i = 0; i < NUM_UNIQUE_ROWS; i++) {
-        row_maps[i].row_pin = i; // Assigning pins 0-14 as the row pins
-        row_maps[i].num_keys_on_row = 0;
-    }
-}
-
+// UPDATED: init_key now initializes the new state machine variables.
 void init_key(unsigned int key_index, uint8_t note_number, unsigned int r_pin_f, unsigned int c_pin_f, unsigned int r_pin_s, unsigned int c_pin_s) {
     keys[key_index].row_pin_first = r_pin_f;
     keys[key_index].col_pin_first = c_pin_f;
@@ -100,40 +92,26 @@ void init_key(unsigned int key_index, uint8_t note_number, unsigned int r_pin_f,
     keys[key_index].col_pin_second = c_pin_s;
     keys[key_index].note_number = note_number;
     keys[key_index].state = STATE_RELEASED;
-    keys[key_index].first_press_time = 0;
-    keys[key_index].last_irq_time = 0;
+    keys[key_index].event_time = 0;
 
-    // Add this key's index to the correct row map for fast lookup in the ISR
-    RowMapping* map = find_row_map(r_pin_f);
-    if (map) {
-        map->key_indices[map->num_keys_on_row++] = key_index;
-    }
 
-    // Columns are now inputs by default to avoid contention.
-    // They will be briefly switched to outputs inside the ISR.
     gpio_init(c_pin_f);
-    gpio_set_dir(c_pin_f, GPIO_IN);
-    gpio_disable_pulls(c_pin_f);
+    gpio_set_dir(c_pin_f, GPIO_OUT);
+    gpio_set_drive_strength(c_pin_f, GPIO_DRIVE_STRENGTH_12MA);
 
     gpio_init(c_pin_s);
-    gpio_set_dir(c_pin_s, GPIO_IN);
-    gpio_disable_pulls(c_pin_s);
+    gpio_set_dir(c_pin_s, GPIO_OUT);
+    gpio_set_drive_strength(c_pin_s, GPIO_DRIVE_STRENGTH_12MA);
 
-    // Rows are inputs with pull-ups. An interrupt is triggered when a key press
-    // pulls the row to ground.
+
     gpio_init(r_pin_f);
     gpio_set_dir(r_pin_f, GPIO_IN);
-    gpio_pull_up(r_pin_f);
 
     gpio_init(r_pin_s);
     gpio_set_dir(r_pin_s, GPIO_IN);
-    gpio_pull_up(r_pin_s);
 }
 
 void init_keys(void) {
-    // Must init maps first!
-    init_row_maps();
-
     init_key(0, 21, 14, 17, 14, 23);
     init_key(1, 22, 14, 18, 14, 24);
     init_key(2, 23, 14, 19, 14, 25);
@@ -228,22 +206,21 @@ void init_keys(void) {
 int main(void)
 {
     stdio_init_all();
+    // It's good practice to leave stdio enabled for debugging prints.
+    // uart_deinit(uart0);
+    // uart_deinit(uart1);
+
+    // init device stack on configured roothub port
     tud_init(BOARD_TUD_RHPORT);
+
     multicore_launch_core1(usb_core_task);
+
     init_keys();
 
-    // Set up the interrupt for all row pins.
-    // The same callback function will handle all of them.
-    gpio_set_irq_enabled_with_callback(0, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true, &gpio_callback);
-    for (int i = 1; i <= 14; i++) {
-        gpio_set_irq_enabled(i, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
-    }
 
-    // The main loop for core 0 is now empty! It will just sleep
-    // until an interrupt happens.
     while (1)
     {
-        __wfi(); // Wait for Interrupt
+        scan_matrix();
     }
 
     return 0;
@@ -256,113 +233,166 @@ void usb_core_task(void)
     gpio_pull_up(SUSTAIN_PIN);
     while (1)
     {
-        tud_task();
+        tud_task(); // tinyusb device task
         midi_task();
     }
 }
 
-// --- THE INTERRUPT SERVICE ROUTINE ---
-// This function is the heart of the new design. It runs whenever a key is pressed or released.
-// It must be fast and cannot contain any long delays.
-void gpio_callback(uint gpio, uint32_t events) {
+uint8_t scan_row_col(unsigned int col, unsigned int row) {
+    //turn on column pin
+    gpio_put(col, 1);
+    // Wait for ~1 microsecond for the GPIO voltage to stabilize across the matrix wiring.
+    // This is necessary because of the inherent capacitance of the wires.
+    // Using sleep_us is a cleaner way to express a time-based delay than busy_wait_at_least_cycles.
+    sleep_us(1);
+    //Test RowPin
+    uint8_t state = gpio_get(row);
+    gpio_put(col, 0);
+    return state;
+}
+
+// REWRITTEN: scan_matrix function
+// This now implements a full state machine for each key to handle debouncing
+// for both presses and releases, ensuring clean signals for timing.
+void scan_matrix(void)
+{
     uint64_t now = time_us_64();
 
-    // Find all keys associated with the row that triggered the interrupt.
-    RowMapping* map = find_row_map(gpio);
-    if (!map) return;
+    for (int i = 0; i < NUMBER_KEYS; i++) {
+        KeyInfo *key = &keys[i];
+        uint8_t first_state = scan_row_col(key->col_pin_first, key->row_pin_first);
+        uint8_t second_state = scan_row_col(key->col_pin_second,key->row_pin_second);
 
-    // --- DEBOUNCING ---
-    // We use a simple time-based debounce. If an interrupt for this row happened
-    // very recently, we ignore this one as it's likely just noise.
-    // We check the first key's last_irq_time as a representative for the whole row.
-    if (now - keys[map->key_indices[0]].last_irq_time < DEBOUNCE_US) {
-        return;
-    }
-    // Update the debounce timestamp for all keys on this row.
-    for (int i = 0; i < map->num_keys_on_row; i++) {
-        keys[map->key_indices[i]].last_irq_time = now;
-    }
+        // This switch statement is the new state machine logic for each key.
+        switch (key->state) {
+            case STATE_RELEASED:
+                if (first_state) {
+                    key->state = STATE_DEBOUNCE_PRESS;
+                    key->event_time = now; // Start debounce timer
+                }
+                break;
 
+            case STATE_DEBOUNCE_PRESS:
+                if (!first_state) { // It bounced back up, so reset.
+                    key->state = STATE_RELEASED;
+                } else if (now - key->event_time > DEBOUNCE_US) {
+                    // It has been stable for the debounce period.
+                    // This is the true start time for our velocity calculation.
+                    key->state = STATE_PRESSED_FIRST;
+                    key->event_time = now;
+                }
+                break;
 
-    // --- IDENTIFY WHICH KEY(S) ON THE ROW CHANGED ---
-    // To do this, we briefly set each column pin to an output and drive it low,
-    // then check if the interrupted row pin is still low.
-    for (int i = 0; i < map->num_keys_on_row; i++) {
-        KeyInfo* key = &keys[map->key_indices[i]];
+            case STATE_PRESSED_FIRST:
+                if (second_state) {
+                    // Second sensor hit, start debouncing it.
+                    key->state = STATE_DEBOUNCE_SECOND;
+                    // We don't update event_time here because we need the time from the *first* press.
+                } else if (!first_state) {
+                    // Key was released before hitting the second sensor. Reset.
+                    key->state = STATE_RELEASED;
+                }
+                break;
 
-        // Check first sensor
-        gpio_set_dir(key->col_pin_first, GPIO_OUT);
-        gpio_put(key->col_pin_first, 0);
-        sleep_us(1); // Allow time for the line to settle
-        bool first_pressed = !gpio_get(key->row_pin_first);
-        gpio_set_dir(key->col_pin_first, GPIO_IN); // Set back to input
+            case STATE_DEBOUNCE_SECOND:
+                 if (!second_state) { // It bounced back. Go back to waiting for it.
+                    key->state = STATE_PRESSED_FIRST;
+                 } else if (now - key->event_time > DEBOUNCE_US) {
+                    // Second sensor is stable. Key is fully pressed.
+                    // Calculate velocity and send Note On.
+                    key->state = STATE_PRESSED_FULL;
 
-        // Check second sensor
-        gpio_set_dir(key->col_pin_second, GPIO_OUT);
-        gpio_put(key->col_pin_second, 0);
-        sleep_us(1);
-        bool second_pressed = !gpio_get(key->row_pin_second);
-        gpio_set_dir(key->col_pin_second, GPIO_IN);
+                    #ifdef VELOCITY_ENABLED
+                        uint32_t time_diff = now - key->event_time;
+                        MidiNoteMessage note;
+                        note.data.note = key->note_number;
+                        note.data.on = 1;
+                        note.data.time_diff = (uint16_t) time_diff;
+                        multicore_fifo_push_blocking(note.bits);
+                    #endif
+                 }
+                 break;
 
+            case STATE_PRESSED_FULL:
+                if (!first_state && !second_state) {
+                    // Both sensors are released, start debounce for release.
+                    key->state = STATE_DEBOUNCE_RELEASE;
+                    key->event_time = now;
+                }
+                break;
 
-        // --- STATE MACHINE LOGIC ---
-        if (first_pressed && key->state == STATE_RELEASED) {
-            // First sensor was pressed, start timing for velocity.
-            key->state = STATE_PRESSED_FIRST;
-            key->first_press_time = now;
-
-        } else if (second_pressed && key->state == STATE_PRESSED_FIRST) {
-            // Second sensor was pressed, this is a NOTE ON event.
-            // We keep the state as PRESSED_FIRST because the release logic
-            // depends on both sensors being released.
-            uint32_t time_diff = now - key->first_press_time;
-
-            MidiNoteMessage note;
-            note.data.note = key->note_number;
-            note.data.on = 1;
-            note.data.time_diff = (uint16_t)time_diff;
-            multicore_fifo_push_blocking(note.bits);
-
-        } else if (!first_pressed && !second_pressed && key->state == STATE_PRESSED_FIRST) {
-            // Both sensors are now released, this is a NOTE OFF event.
-            key->state = STATE_RELEASED;
-            key->first_press_time = 0;
-
-            MidiNoteMessage note;
-            note.data.note = key->note_number;
-            note.data.on = 0;
-            note.data.time_diff = 0;
-            multicore_fifo_push_blocking(note.bits);
+            case STATE_DEBOUNCE_RELEASE:
+                if (first_state || second_state) { // Bounced back to pressed
+                    key->state = STATE_PRESSED_FULL;
+                } else if (now - key->event_time > DEBOUNCE_US) {
+                    // Stable release confirmed. Send Note Off.
+                    key->state = STATE_RELEASED;
+                    MidiNoteMessage note;
+                    note.data.note = key->note_number;
+                    note.data.on = 0;
+                    note.data.time_diff = 0; // Not used for note-off
+                    multicore_fifo_push_blocking(note.bits);
+                }
+                break;
         }
     }
 }
 
+//--------------------------------------------------------------------+
+// Device callbacks
+//--------------------------------------------------------------------+
 
+void tud_mount_cb(void) {}
+void tud_umount_cb(void) {}
+void tud_suspend_cb(bool remote_wakeup_en) {(void) remote_wakeup_en;}
+void tud_resume_cb(void) {}
+
+//--------------------------------------------------------------------+
+// MIDI Task
+//--------------------------------------------------------------------+
+
+
+// REWRITTEN: calculateVelocity function
+// This now uses an exponential curve for a more natural, musical feel.
+// You can adjust the "feel" by changing VELOCITY_CURVE_EXPONENT at the top of the file.
 uint8_t calculateVelocity(uint32_t timeDiff) {
+    // Clamp the time difference to our defined min/max range.
     if (timeDiff < VELOCITY_TD_MIN) timeDiff = VELOCITY_TD_MIN;
     if (timeDiff > VELOCITY_TD_MAX) timeDiff = VELOCITY_TD_MAX;
 
+    // Normalize the value so that fastest press (min time) = 1.0 and slowest press (max time) = 0.0.
     float normalized_time = (float)(VELOCITY_TD_MAX - timeDiff) / (float)(VELOCITY_TD_MAX - VELOCITY_TD_MIN);
+
+    // Apply the exponential curve.
     float curved_value = powf(normalized_time, VELOCITY_CURVE_EXPONENT);
+
+    // Scale to MIDI velocity range (1-127)
     uint8_t velocity = (uint8_t)(curved_value * 126.0f) + 1;
 
+    // Final clamp to ensure it's within MIDI spec.
     if (velocity > 127) velocity = 127;
     if (velocity < 1) velocity = 1;
+
     return velocity;
 }
 
 void midi_task(void)
 {
-    uint8_t const cable_num = 0;
-    uint8_t const channel   = 0;
+    uint8_t const cable_num = 0; // MIDI jack associated with USB endpoint
+    uint8_t const channel   = 0; // 0 for channel 1
 
+    // The MIDI interface always creates input and output port/jack descriptors
+    // regardless of these being used or not. Therefore incoming traffic should be read
+    // (possibly just discarded) to avoid the sender blocking in IO
     uint8_t packet[4];
     while ( tud_midi_available() ) tud_midi_packet_read(packet);
+
 
     if (multicore_fifo_rvalid()) {
         MidiNoteMessage note;
         note.bits = multicore_fifo_pop_blocking();
 
+        // Use the new velocity calculation for Note On, velocity is 0 for Note Off.
         uint8_t velocity = note.data.on ? calculateVelocity(note.data.time_diff) : 0;
         uint8_t note_stream[3] = {
             (note.data.on ? 0x90 : 0x80) | channel,
@@ -374,17 +404,21 @@ void midi_task(void)
     }
 
     uint64_t current_time = time_us_64();
+
+    // Debounce logic for the sustain pedal to prevent it from sending a stream of messages.
     if (gpio_get(SUSTAIN_PIN) == 0 && Sustain_Pressed == 0 && current_time - last_sustain_time > 25000) {
         Sustain_Pressed = 1;
         last_sustain_time = current_time;
         uint8_t cc_stream[3] = { 0xB0 | channel, 64, 127 };
+        printf("Sending CC 64 ON (Sustain)\n");
         tud_midi_stream_write(cable_num, cc_stream, 3);
     }
 
     if (gpio_get(SUSTAIN_PIN) == 1 && Sustain_Pressed == 1 && current_time - last_sustain_time > 25000) {
         Sustain_Pressed = 0;
-        last_sustain_time = current_time;
+        last_sustain_time = current_time; // Update time here too
         uint8_t cc_stream[3] = { 0xB0 | channel, 64, 0 };
+        printf("Sending CC 64 OFF (Sustain)\n");
         tud_midi_stream_write(cable_num, cc_stream, 3);
     }
 }
