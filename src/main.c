@@ -26,7 +26,7 @@
 // = 1.0: Linear curve (like your original code).
 // < 1.0: It's easier to play loud notes.
 // A good starting point is 1.5 or 2.0.
-#define VELOCITY_CURVE_EXPONENT 1.5f
+#define VELOCITY_CURVE_EXPONENT 1.6f
 
 // DEBOUNCE_US: Time in microseconds to wait for a key state to be stable before accepting it.
 // This prevents noise from creating false key presses. 5000us (5ms) is a good starting point.
@@ -244,9 +244,10 @@ uint8_t scan_row_col(unsigned int col, unsigned int row) {
     // Wait for ~1 microsecond for the GPIO voltage to stabilize across the matrix wiring.
     // This is necessary because of the inherent capacitance of the wires.
     // Using sleep_us is a cleaner way to express a time-based delay than busy_wait_at_least_cycles.
-    sleep_us(1);
+    sleep_us(2);
     //Test RowPin
     uint8_t state = gpio_get(row);
+    sleep_us(1);
     gpio_put(col, 0);
     return state;
 }
